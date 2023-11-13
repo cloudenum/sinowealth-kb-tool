@@ -40,7 +40,7 @@ pub const PART_TERPORT_TR95: Part = Part {
     product_id: 0x0049,
 };
 
-pub const PART_DA_GAMING_WARRIOR_X: Part = Part {
+pub const PART_DA_WARRIOR_X: Part = Part {
     flash_size: 61440, // 61440 until bootloader
     bootloader_size: 4096,
     page_size: 2048,
@@ -56,7 +56,7 @@ pub static PARTS: phf::Map<&'static str, Part> = phf_map! {
     "xinmeng-k916" => PART_XINMENG_K916,
     "re-k70-byk800" => PART_RE_K70_BYK800,
     "terport-tr95" => PART_TERPORT_TR95,
-    "da-gaming-warrior-x" => PART_DA_GAMING_WARRIOR_X
+    "da-warrior-x" => PART_DA_WARRIOR_X
 };
 
 impl Part {
