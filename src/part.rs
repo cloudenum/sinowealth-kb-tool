@@ -40,6 +40,14 @@ pub const PART_TERPORT_TR95: Part = Part {
     product_id: 0x0049,
 };
 
+pub const PART_DA_GAMING_WARRIOR_X: Part = Part {
+    flash_size: 61440, // 61440 until bootloader
+    bootloader_size: 4096,
+    page_size: 2048,
+    vendor_id: 0x258a,
+    product_id: 0x0090,
+};
+
 pub static PARTS: phf::Map<&'static str, Part> = phf_map! {
     "nuphy-air60" => PART_NUPHY_AIR60,
     "nuphy-air75" => PART_NUPHY_AIR60, // same as nuphy-air60
@@ -47,7 +55,8 @@ pub static PARTS: phf::Map<&'static str, Part> = phf_map! {
     "nuphy-halo65" => PART_NUPHY_AIR60, // same as nuphy-air60
     "xinmeng-k916" => PART_XINMENG_K916,
     "re-k70-byk800" => PART_RE_K70_BYK800,
-    "terport-tr95" => PART_TERPORT_TR95
+    "terport-tr95" => PART_TERPORT_TR95,
+    "da-gaming-warrior-x" => PART_DA_GAMING_WARRIOR_X
 };
 
 impl Part {
