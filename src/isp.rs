@@ -1,7 +1,6 @@
 use std::{thread, time};
 
-use hidapi::DeviceInfo;
-use log::*;
+use log::{debug, info};
 use thiserror::Error;
 
 use super::{part::*, util};
@@ -18,11 +17,14 @@ const GAMING_KB_PRODUCT_ID: u16 = 0x1020;
 
 const COMMAND_LENGTH: usize = 6;
 
+const HID_ISP_USAGE_PAGE: u16 = 0xff00;
+const HID_ISP_USAGE: u16 = 0x0001;
+
 const REPORT_ID_CMD: u8 = 0x05;
 const REPORT_ID_XFER: u8 = 0x06;
 
 const CMD_ISP_MODE: u8 = 0x75;
-const CMD_MAGIC_SAUCE: u8 = 0x55; // uncertain how this command works, hence the name
+const CMD_ENABLE_FIRMWARE: u8 = 0x55;
 const CMD_INIT_READ: u8 = 0x52;
 const CMD_INIT_WRITE: u8 = 0x57;
 const CMD_ERASE: u8 = 0x45;
@@ -30,19 +32,17 @@ const CMD_ERASE: u8 = 0x45;
 const XFER_READ_PAGE: u8 = 0x72;
 const XFER_WRITE_PAGE: u8 = 0x77;
 
-const LJMP_OPCODE: u8 = 0x02;
-
-pub struct ISPDevice<'a> {
+pub struct ISPDevice {
     request_device: HidDevice,
     #[cfg(target_os = "windows")]
     data_device: HidDevice,
-    part: &'a Part,
+    part: Part,
 }
 
 #[derive(Debug, Error)]
 pub enum ISPError {
-    #[error("Duplicate devices found")]
-    DuplicateDevices(String, String),
+    #[error("Unusual number of matching HID devices: {0}")]
+    IrregularDeviceCount(usize),
     #[error("Device not found")]
     NotFound,
     #[error(transparent)]
@@ -64,8 +64,8 @@ struct HIDDevices {
     data: HidDevice,
 }
 
-impl ISPDevice<'static> {
-    pub fn new(part: &'static Part) -> Result<Self, ISPError> {
+impl ISPDevice {
+    pub fn new(part: Part) -> Result<Self, ISPError> {
         let devices = Self::find_isp_device(part)?;
         Ok(Self {
             request_device: devices.request,
@@ -87,84 +87,66 @@ impl ISPDevice<'static> {
     fn open_isp_devices() -> Result<HIDDevices, ISPError> {
         let api = Self::hidapi();
 
-        let mut request_device: Option<&DeviceInfo> = None;
-        #[cfg(target_os = "windows")]
-        let mut data_device: Option<&DeviceInfo> = None;
+        let devices: Vec<_> = api
+            .device_list()
+            .filter(|d| {
+                #[cfg(not(target_os = "linux"))]
+                return d.vendor_id() == GAMING_KB_VENDOR_ID
+                    && d.product_id() == GAMING_KB_PRODUCT_ID
+                    && d.usage_page() == HID_ISP_USAGE_PAGE
+                    && d.usage() == HID_ISP_USAGE;
+                #[cfg(target_os = "linux")]
+                return d.vendor_id() == GAMING_KB_VENDOR_ID
+                    && d.product_id() == GAMING_KB_PRODUCT_ID;
+            })
+            .collect();
 
-        for device_info in api.device_list() {
-            if !(device_info.vendor_id() == GAMING_KB_VENDOR_ID
-                && device_info.product_id() == GAMING_KB_PRODUCT_ID)
-            {
-                continue;
-            }
-
-            let path = device_info.path();
-            let path_str = path.to_str().unwrap();
-
-            debug!("Enumerating: {}", path_str);
-
-            #[cfg(target_os = "windows")]
-            {
-                // Windows requires that we use specific devices for requests and data
-                // https://learn.microsoft.com/en-us/windows-hardware/drivers/hid/hidclass-hardware-ids-for-top-level-collections
-                if path_str.contains("Col02") {
-                    if let Some(request_device) = request_device {
-                        return Err(ISPError::DuplicateDevices(
-                            request_device.path().to_str().unwrap().to_owned(),
-                            path_str.to_owned(),
-                        ));
-                    }
-                    request_device = Some(device_info);
-                    continue;
-                }
-
-                if path_str.contains("Col03") {
-                    if let Some(data_device) = data_device {
-                        return Err(ISPError::DuplicateDevices(
-                            data_device.path().to_str().unwrap().to_owned(),
-                            path_str.to_owned(),
-                        ));
-                    }
-                    data_device = Some(device_info);
-                    continue;
-                }
-            };
-
-            #[cfg(not(target_os = "windows"))]
-            if let Some(request_device) = request_device {
-                if request_device.path() != path {
-                    warn!("Duplicate device found. Only the first one will be used");
-                }
-                continue;
-            } else {
-                request_device = Some(device_info);
-                continue;
-            };
+        for d in &devices {
+            #[cfg(not(target_os = "linux"))]
+            debug!(
+                "Found Device: {:?} {:#06x} {:#06x}",
+                d.path(),
+                d.usage_page(),
+                d.usage()
+            );
+            #[cfg(target_os = "linux")]
+            debug!("Found Device: {:?}", d.path());
         }
 
-        if let Some(request_device) = request_device {
-            debug!("Request device: {:?}", request_device.path());
-            #[cfg(target_os = "windows")]
-            if let Some(data_device) = data_device {
-                debug!("Data device: {:?}", data_device.path());
-                return Ok(HIDDevices {
-                    request: api.open_path(request_device.path()).unwrap(),
-                    data: api.open_path(data_device.path()).unwrap(),
-                });
-            } else {
-                return Err(ISPError::NotFound);
-            }
+        let device_count = devices.len();
+        if device_count == 0 {
+            return Err(ISPError::NotFound);
+        }
 
-            #[cfg(not(target_os = "windows"))]
+        #[cfg(not(target_os = "windows"))]
+        if device_count == 1 {
+            let request_device = devices.first().unwrap();
+            debug!("Request device: {:?}", request_device.path());
             return Ok(HIDDevices {
                 request: api.open_path(request_device.path()).unwrap(),
             });
         } else {
-            Err(ISPError::NotFound)
+            return Err(ISPError::IrregularDeviceCount(device_count));
+        }
+
+        #[cfg(target_os = "windows")]
+        if device_count == 1 {
+            return Err(ISPError::IrregularDeviceCount(device_count));
+        } else if device_count == 2 {
+            let request_device = devices[0];
+            let data_device = devices[1];
+            debug!("Request device: {:?}", request_device.path());
+            debug!("Data device: {:?}", data_device.path());
+            return Ok(HIDDevices {
+                request: api.open_path(request_device.path()).unwrap(),
+                data: api.open_path(data_device.path()).unwrap(),
+            });
+        } else {
+            return Err(ISPError::IrregularDeviceCount(device_count));
         }
     }
 
-    fn switch_kb_device(part: &Part) -> Result<HIDDevices, ISPError> {
+    fn switch_kb_device(part: Part) -> Result<HIDDevices, ISPError> {
         let api = Self::hidapi();
 
         info!(
@@ -175,19 +157,33 @@ impl ISPDevice<'static> {
         let request_device_info = api
             .device_list()
             .filter(|d| {
-                d.vendor_id() == part.vendor_id
+                #[cfg(not(target_os = "linux"))]
+                return d.vendor_id() == part.vendor_id
                     && d.product_id() == part.product_id
-                    && d.interface_number() == 1
+                    && d.usage_page() == part.isp_usage_page
+                    && d.usage() == part.isp_usage;
+                #[cfg(target_os = "linux")]
+                return d.vendor_id() == part.vendor_id && d.product_id() == part.product_id;
             })
-            .find(|_d| {
+            .enumerate()
+            .find_map(|(_i, d)| {
+                #[cfg(not(target_os = "linux"))]
+                debug!(
+                    "Found Device: {:?} {:#06x} {:#06x}",
+                    d.path(),
+                    d.usage_page(),
+                    d.usage()
+                );
+                #[cfg(target_os = "linux")]
+                debug!("Found Device: {:?}", d.path());
                 #[cfg(target_os = "windows")]
-                {
-                    return String::from_utf8_lossy(_d.path().to_bytes())
-                        .to_string()
-                        .contains("Col05");
+                if _i == part.isp_index {
+                    return Some(d);
+                } else {
+                    return None;
                 }
                 #[cfg(not(target_os = "windows"))]
-                true
+                Some(d)
             });
 
         let Some(request_device_info) = request_device_info else {
@@ -199,7 +195,7 @@ impl ISPDevice<'static> {
 
         let device = api.open_path(request_device_info.path()).unwrap();
 
-        info!("Found Regular device. Entering ISP mode...");
+        info!("Found regular device. Entering ISP mode...");
         Self::enter_isp_mode(&device)?;
 
         info!("Waiting for ISP device...");
@@ -213,11 +209,11 @@ impl ISPDevice<'static> {
         Ok(isp_device)
     }
 
-    fn find_isp_device(part: &Part) -> Result<HIDDevices, ISPError> {
+    fn find_isp_device(part: Part) -> Result<HIDDevices, ISPError> {
         Self::find_isp_device_retry(part, MAX_RETRIES)
     }
 
-    fn find_isp_device_retry(part: &Part, retries: usize) -> Result<HIDDevices, ISPError> {
+    fn find_isp_device_retry(part: Part, retries: usize) -> Result<HIDDevices, ISPError> {
         for attempt in 1..retries + 1 {
             if attempt > 1 {
                 thread::sleep(time::Duration::from_millis(500));
@@ -244,40 +240,35 @@ impl ISPDevice<'static> {
     }
 
     pub fn read_cycle(&self, read_type: ReadType) -> Result<Vec<u8>, ISPError> {
-        self.magic_sauce()?;
+        self.enable_firmware()?;
 
-        match read_type {
-            ReadType::Normal => self.read(0, self.part.flash_size),
-            ReadType::Bootloader => self.read(self.part.flash_size, self.part.bootloader_size),
-            ReadType::Full => self.read(0, self.part.flash_size + self.part.bootloader_size),
-        }
+        let firmware = match read_type {
+            ReadType::Normal => self.read(0, self.part.firmware_size)?,
+            ReadType::Bootloader => {
+                self.read(self.part.firmware_size, self.part.bootloader_size)?
+            }
+            ReadType::Full => self.read(0, self.part.firmware_size + self.part.bootloader_size)?,
+        };
+
+        return Ok(firmware);
     }
 
     pub fn write_cycle(&self, firmware: &mut Vec<u8>) -> Result<(), ISPError> {
-        let length = firmware.len();
+        // ensure that the address at <firmware_size-4> is the same as the reset vector
+        firmware.copy_within(1..3, self.part.firmware_size - 4);
 
         self.erase()?;
-        self.write(firmware)?;
-        let written = self.read(0, self.part.flash_size)?;
+        self.write(0, firmware)?;
 
-        // ARCANE: the ISP will copy the LJMP instruction (if existing) from the end to the very start of memory.
-        // We need to make modifications to the expected payload to account for this.
-        if firmware[length - 5] == LJMP_OPCODE {
-            firmware[0] = LJMP_OPCODE;
-            firmware.copy_within((length - 4)..(length - 2), 1); // Copy LJMP address
-            firmware[(length - 5)..(length - 2)].fill(0); // Cleanup
-        }
+        // cleanup the address at <firmware_size-4>
+        firmware[self.part.firmware_size - 4..self.part.firmware_size - 2].fill(0);
+
+        let read_back = self.read(0, self.part.firmware_size)?;
 
         info!("Verifying...");
-        util::verify(firmware, &written).map_err(ISPError::from)?;
-        self.finalize()?;
-        Ok(())
-    }
+        util::verify(firmware, &read_back).map_err(ISPError::from)?;
 
-    pub fn erase_cycle(&self) -> Result<(), ISPError> {
-        info!("Erasing...");
-        self.erase()?;
-        self.finalize()?;
+        self.enable_firmware()?;
         Ok(())
     }
 
@@ -288,31 +279,9 @@ impl ISPDevice<'static> {
         &self.request_device
     }
 
-    /// Allows firmware to be read prior to erasing it
-    fn magic_sauce(&self) -> Result<(), ISPError> {
-        let cmd: [u8; COMMAND_LENGTH] = [
-            REPORT_ID_CMD,
-            CMD_MAGIC_SAUCE,
-            0x00,
-            0x00,
-            (self.part.flash_size & 0xff) as u8,
-            (self.part.flash_size >> 8) as u8,
-        ];
-
-        self.request_device.send_feature_report(&cmd)?;
-        Ok(())
-    }
-
     fn read(&self, start_addr: usize, length: usize) -> Result<Vec<u8>, ISPError> {
-        let cmd: [u8; COMMAND_LENGTH] = [
-            REPORT_ID_CMD,
-            CMD_INIT_READ,
-            (start_addr & 0xff) as u8,
-            (start_addr >> 8) as u8,
-            (length & 0xff) as u8,
-            (length >> 8) as u8,
-        ];
-        self.request_device.send_feature_report(&cmd)?;
+        info!("Reading...");
+        self.init_read(start_addr)?;
 
         let page_size = self.part.page_size;
         let num_page = length / page_size;
@@ -328,6 +297,51 @@ impl ISPDevice<'static> {
         Ok(result)
     }
 
+    fn write(&self, start_addr: usize, buffer: &[u8]) -> Result<(), ISPError> {
+        info!("Writing...");
+        self.init_write(start_addr)?;
+
+        let page_size = self.part.page_size;
+        for i in 0..self.part.num_pages() {
+            debug!("Writing page {} @ offset {:#06x}", i, i * page_size);
+            self.write_page(&buffer[(i * page_size)..((i + 1) * page_size)])?;
+        }
+        Ok(())
+    }
+
+    /// Initializes the read operation / sets the initial read address
+    fn init_read(&self, start_addr: usize) -> Result<(), ISPError> {
+        let cmd: [u8; COMMAND_LENGTH] = [
+            REPORT_ID_CMD,
+            CMD_INIT_READ,
+            (start_addr & 0xff) as u8,
+            (start_addr >> 8) as u8,
+            0,
+            0,
+        ];
+        self.request_device
+            .send_feature_report(&cmd)
+            .map_err(ISPError::from)?;
+        Ok(())
+    }
+
+    /// Initializes the write operation / sets the initial write address
+    fn init_write(&self, start_addr: usize) -> Result<(), ISPError> {
+        let cmd: [u8; COMMAND_LENGTH] = [
+            REPORT_ID_CMD,
+            CMD_INIT_WRITE,
+            (start_addr & 0xff) as u8,
+            (start_addr >> 8) as u8,
+            0,
+            0,
+        ];
+        self.request_device
+            .send_feature_report(&cmd)
+            .map_err(ISPError::from)?;
+        Ok(())
+    }
+
+    /// Reads one page of flash contents
     fn read_page(&self, buf: &mut Vec<u8>) -> Result<(), ISPError> {
         let page_size = self.part.page_size;
         let mut xfer_buf: Vec<u8> = vec![0; page_size + 2];
@@ -340,71 +354,46 @@ impl ISPDevice<'static> {
         Ok(())
     }
 
-    fn write(&self, buffer: &[u8]) -> Result<(), ISPError> {
-        info!("Writing...");
-        let cmd: [u8; COMMAND_LENGTH] = [
-            REPORT_ID_CMD,
-            CMD_INIT_WRITE,
-            0,
-            0,
-            (self.part.flash_size & 0xff) as u8,
-            (self.part.flash_size >> 8) as u8,
-        ];
-
-        self.request_device
-            .send_feature_report(&cmd)
-            .map_err(ISPError::from)?;
-
-        let page_size = self.part.page_size;
-        for i in 0..self.part.num_pages() {
-            debug!("Writting page {} @ offset {:#06x}", i, i * page_size);
-            self.write_page(&buffer[(i * page_size)..((i + 1) * page_size)])?;
-        }
-        Ok(())
-    }
-
+    /// Writes one page to flash
+    ///
+    /// Note: The first 3 bytes at address 0x0000 (first-page) are skipped. Instead the second and
+    /// third bytes (firmware's reset vector LJMP destination address) are written to address
+    /// <firmware_size-4> and will later be part of the LJMP instruction after the firmware is
+    /// enabled (`enable_firmware`). This only works once after an erase operation.
     fn write_page(&self, buf: &[u8]) -> Result<(), ISPError> {
-        let page_size = self.part.page_size;
-        let mut xfer_buf: Vec<u8> = vec![0; page_size + 2];
+        let length = buf.len() + 2;
+        let mut xfer_buf: Vec<u8> = vec![0; length];
         xfer_buf[0] = REPORT_ID_XFER;
         xfer_buf[1] = XFER_WRITE_PAGE;
-        xfer_buf[2..page_size + 2].clone_from_slice(buf);
+        xfer_buf[2..length].clone_from_slice(buf);
         self.data_device()
             .send_feature_report(&xfer_buf)
             .map_err(ISPError::from)?;
         Ok(())
     }
 
+    /// Sets a LJMP (0x02) opcode at <firmware_size-5>.
+    /// This enables the main firmware by making the bootloader jump to it on reset.
+    ///
+    /// Side-effect: enables reading the firmware without erasing flash first.
+    /// Credits to @gashtaan for finding this out.
+    fn enable_firmware(&self) -> Result<(), ISPError> {
+        info!("Enabling firmware...");
+        let cmd: [u8; COMMAND_LENGTH] = [REPORT_ID_CMD, CMD_ENABLE_FIRMWARE, 0, 0, 0, 0];
+
+        self.request_device.send_feature_report(&cmd)?;
+        Ok(())
+    }
+
+    /// Erases everything in flash, except the ISP bootloader section itself and initializes the
+    /// reset vector to jump to ISP.
     fn erase(&self) -> Result<(), ISPError> {
         info!("Erasing...");
-        let cmd: [u8; COMMAND_LENGTH] = [
-            REPORT_ID_CMD,
-            CMD_ERASE,
-            CMD_ERASE,
-            CMD_ERASE,
-            CMD_ERASE,
-            CMD_ERASE,
-        ];
+        let cmd: [u8; COMMAND_LENGTH] = [REPORT_ID_CMD, CMD_ERASE, 0, 0, 0, 0];
         self.request_device
             .send_feature_report(&cmd)
             .map_err(ISPError::from)?;
         thread::sleep(time::Duration::from_millis(2000));
-        Ok(())
-    }
-
-    fn finalize(&self) -> Result<(), ISPError> {
-        info!("Finalizing...");
-        let cmd: [u8; COMMAND_LENGTH] = [
-            REPORT_ID_CMD,
-            CMD_MAGIC_SAUCE,
-            CMD_MAGIC_SAUCE,
-            CMD_MAGIC_SAUCE,
-            CMD_MAGIC_SAUCE,
-            CMD_MAGIC_SAUCE,
-        ];
-        self.request_device
-            .send_feature_report(&cmd)
-            .map_err(ISPError::from)?;
         Ok(())
     }
 }
